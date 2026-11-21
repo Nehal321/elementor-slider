@@ -1,0 +1,107 @@
+name: Feather Slider
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test_rollback:
+        description: Exercise rollback on staging after a successful deployment
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check PHP, JavaScript and Bash syntax
+        run: |
+          php -l feather-slider/feather-slider.php
+          php -l feather-slider/includes/class-slider-widget.php
+          php -l scripts/seed-preview.php
+          node --check feather-slider/assets/slider.js
+          bash -n scripts/deploy-staging.sh
+          bash -n scripts/run-staging-deploy.sh
+      - name: Build and verify the WordPress plugin ZIP
+        run: |
+          python3 scripts/package.py --build "$GITHUB_SHA"
+          unzip -t dist/feather-slider.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: feather-slider
+          path: dist/feather-slider.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  staging:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.preview_url }}
+    concurrency:
+      group: feather-slider-staging
+      queue: max
+    steps:
+      - name: Check staging configuration and commit
+        id: ready
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ -z "$STAGING_URL" ]]; then
+            echo 'Staging skipped. Set STAGING_URL to enable deployment.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          latest=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq .object.sha)
+          if [[ "$latest" != "$GITHUB_SHA" ]]; then
+            echo 'Staging skipped. A newer commit is on main.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'deploy=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.ready.outputs.deploy == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        if: steps.ready.outputs.deploy == 'true'
+        with:
+          name: feather-slider
+          path: dist
+      - name: Deploy to WordPress staging over SSH
+        id: deploy
+        if: steps.ready.outputs.deploy == 'true'
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+          STAGING_WP_PATH: ${{ vars.STAGING_WP_PATH }}
+          STAGING_SSH_HOST: ${{ vars.STAGING_SSH_HOST }}
+          STAGING_SSH_PORT: ${{ vars.STAGING_SSH_PORT }}
+          STAGING_SSH_USER: ${{ vars.STAGING_SSH_USER }}
+          STAGING_SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+          STAGING_KNOWN_HOSTS: ${{ secrets.STAGING_KNOWN_HOSTS }}
+          STAGING_HTTP_USER: ${{ secrets.STAGING_HTTP_USER }}
+          STAGING_HTTP_PASSWORD: ${{ secrets.STAGING_HTTP_PASSWORD }}
+          TEST_ROLLBACK: ${{ inputs.test_rollback || false }}
+        run: bash scripts/run-staging-deploy.sh
+      - name: Summarize staging result
+        if: always() && steps.ready.outputs.deploy == 'true'
+        env:
+          PREVIEW_URL: ${{ steps.deploy.outputs.preview_url }}
+          RESULT: ${{ steps.deploy.outcome }}
+        run: |
+          printf '### Feather Slider staging\n\n- Commit `%s`\n- Result **%s**\n' "$GITHUB_SHA" "$RESULT" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "$PREVIEW_URL" ]]; then
+            printf -- '- [Open the staging preview](%s)\n' "$PREVIEW_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
